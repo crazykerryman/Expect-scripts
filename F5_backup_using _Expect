@@ -1,0 +1,437 @@
+#!/usr/local/bin/expect -f
+# 
+# Title    :            script_f5_bigpipe_backup_v1.0.exp
+# Date     :            January 2016
+# Author   :            crazykerryman
+# Purpose  :            Backup F5 LTM using the bigpipe command structure (v9 & v10 only)
+# Jump host:            Name - Hostname 
+# It does rely on an external $file containing the list of assets to be backed up
+# 
+#
+#
+# Variables that allow this script to scale
+# $user                 The username used to log into the devices
+# $password             The password used to log into the devices
+# $backupdir            Where the backups will be finally stored
+# $timestamp            The date and time appended to the end of a backup file
+# $starttime            Timestamp of when the script begun
+# $timeout              If a known response is not seen within x seconds, the script will continue running the next lines of code
+# $devicelist           List of assets the script will run on
+# $border               Used to separate devices in the log file
+# $min_scf_file_size    Used to compare against the backed up SCF file
+# $min_ucs_file_size    Used to compare against the backed up UCS file 
+# $oldf5directory       Used to create a symbolic link pointing to the real file location
+#                       Needed as existing documentation has backups scattered across different folders
+# $hosts                Case sensitive device name
+# $emailto              A script report summary and debug file are sent here each time the script is run 
+# $debug_log            Location where the script debug file will be stored
+# log_file              Contains "send" commands and exp_internal output log
+# $ReportSummary        The location and name of my summary report
+# $ExpiryDays           Number of days old a file must be before being deleted
+
+set user                "user"
+set password            "password"
+set backupdir           "/home/tftpboot/network/config"
+set timestamp           [exec date +%Y-%m-%d-%H%M] 
+set starttime           [exec date]
+set timeout             60
+set devicelist          "/home/crazykerryman/backups/network/f5/network_f5_devicelist.txt"
+set border              "\n#########################################################################################\n\n"
+set min_scf_file_size   "10000"
+set min_ucs_file_size   "200000"
+set oldf5directory      "/home/tftpboot/f5/"
+set emailto             "email@email.com"
+set debug_log           "/home/tftpboot/network/config/debug/f5/f5_script-$timestamp.log"
+log_file                $debug_log
+set ExpiryDays          92
+set ReportSummary       /home/tftpboot/network/config/report/f5/f5_report-$timestamp.txt
+
+
+
+# 'Report' is a function that allows a simple summary file be created as the script runs.
+# It simple includes the device name and tells us if the backup was a success or failure. 
+
+
+proc Report args {
+        global ReportSummary 
+        foreach arg $args {
+                        exec echo $arg >> $ReportSummary
+                        } 
+
+                }
+
+
+
+# 'RSA_Reset' is a function that is called whenever a SSH RSA key on the remote device has changed.
+# This is expected in the case of a device upgrade or replacement.
+# A caveat is that all hostnames in 'known_hosts' are stored in lower case characters.
+# This script uses a variable called $host which contains upper and lower case characters 
+# which makes thing difficult when using the 'ssh-keygen -R' option.
+# The easiest solution was to:
+#        1. Flag that the backup was unsuccessful
+#        2. Pass the hostname with a trailing "," to this function as an argument.
+#        3. Removing the offending host from the known host list. 
+#        4. Sends a notification of the RSA key change on $host.
+#
+# The script then continues onto the next device in the list without completing the backup on $host.
+# As there is a failure, this is detected at the end of the script, and an ITAM INC ticket is raised.
+
+
+proc RSA_Reset args {
+        global devicelist
+        global border
+        foreach arg $args {
+                        puts $arg
+                                exec grep -iv $arg /home/crazykerryman/.ssh/known_hosts > /home/crazykerryman/.ssh/known_hosts.tmp
+                                exec rm /home/crazykerryman/.ssh/known_hosts
+                                exec cp /home/crazykerryman/.ssh/known_hosts.tmp /home/crazykerryman/.ssh/known_hosts
+                        send_user "# --- RSA Key updated ---\n$border"
+                        }
+                }
+
+
+
+send_user "$border\n# --- $starttime Started running backup script. ---\n\n"
+send_user "$border"
+
+
+# the device list is read from $devicelist into an array called $hosts
+# foreach loop will process this array one by one backing up each host in sequence
+
+
+set file [open "$devicelist"]
+set hosts [split [read $file] "\n"]
+close $file
+foreach host $hosts {
+
+                # This first test is to confirm there is a non-null (blank) host.
+                # If so, skip to next host in the device list.
+                # This simply ensures that the last 'blank line' doesn't get processed by the script.
+                # the 'continue' will move onto the next host in the list (if any)
+
+
+                if {$host == ""} {
+                        continue
+                        }
+
+
+                # setting variable specific to this $host.
+                # this will change for each device, and hence needs to be included within the loop.
+                # this is the location on the F5 itself where the backup will be saved
+                # the same file will be overwritten time and time again as this script is run.
+
+
+                set filename "/var/tmp/$host"
+
+
+                # log into device $host as $user
+                # the StrickHostKeyChecking is set to "no" to avoid the yes/no prompt on new hosts
+                # If we see "NASTY" in the output, it is taken to indicate an SSH RSA key change
+                # which is likely in the event of a hardware upgrade or replacement (RMA)
+                # We simple now wait to be prompted for the password
+                # login using the variable defined $password
+
+
+                send_user "# --- Attempting to log into $host ---\n"
+                spawn ssh -o "StrictHostKeyChecking no" $user@$host
+
+
+                expect {
+                        "Connection timed out" {
+                                send_user "# --- Connection to $host timeout --- \n" 
+                                send_user "# --- $host failed ---\n$border" 
+                                Report "$host   failed - timeout"
+                                continue
+                                }
+                        "host/servname not known" {
+                                send_user "# --- DNS lookup to $host failed ---\n"
+                                send_user "# --- $host failed ---\n$border"
+                                Report "$host   failed - DNS failed"
+                                continue
+                                }
+                        "NASTY" {
+                                send_user "# --- the RSA host key to $host has just been changed---\n"
+                                send_user "# --- Calling function to remove RSA key now ---\n"
+                                RSA_Reset "$host,"
+                                Report "$host   failed - RSA key change"
+                                continue
+                                }
+                        "Permission denied"  {
+                                send_user "# --- Not even presented with the password prompt to $host ---\n"
+                                send_user "# --- $host failed ---\n$border"
+                                Report "$host   failed - didn't get a password prompt"
+                                continue
+                                }
+                        "Password: " {
+                                send -- "$password\r"
+                                }
+                        timeout {
+                                send_user "# --- Script timed out while waiting for logging prompt of $host ---\n"
+                                send_user "# --- $host failed ---\n$border"
+                                Report "$host   failed - timeout waiting for password prompt"
+                                continue
+                                }
+                        }
+
+
+                # Expecting the hostname to appear in the prompt.
+                # This is important!!!
+                #               If the hostname is in all small letters in $devicelist
+                #               and the $host has an upper case letter anywhere in its name
+                #               THIS WILL NOT MATCH.
+                #               The device list should reflect the actual hostname.
+                # 
+                #
+                # The script then sends the 'bigpipe save all' and 'bigpipe export'  commands.
+                # Some error checking is included such as
+                #       - A 60 second timeout, after which time the spawn connection is terminated.
+                #       - Searching for the term 'fail' anywhere in the output.
+                #       - Not seeing the expected prompt of $host after executing a command.
+                # Save a copy of the UCS and SCF in the /var/tmp directory and exit
+
+
+                expect {
+                        "@$host" {
+                                send_user "\n# --- Successful login to $host ---\n\n"
+                                send_user "# --- Running bigpipe save all command ---\n"
+                                }
+                        timeout {
+                                send_user "# --- Script timed out after password was entered ---\n"
+                                send_user "# --- Possible devicelist/hostname case sensitive error ---\n"
+                                send_user "# --- $host failed ---\n$border"
+                                Report "$host   failed - timeout after password was entered"
+                                continue
+                                }
+                        }
+
+
+                send -- "bigpipe save all\r"
+                expect {
+                        "fail" {
+                                send_user "\n# --- Something went wrong with the bigpipe save all command ---\n"
+                                send_user "# --- $host failed ---\n"
+                                Report "$host   failed - bigpipe save all"
+                                continue
+                                }
+                        "@$host" {
+                                send_user "\n# --- Command 'bigpipe save all' was successful ---\n\n"
+                                send_user "# --- Saving UCS file to temp directory $filename ---\n"
+                                }
+                        timeout {
+                                send_user "\n# --- Timeout while waiting for 'bigpipe save all' to complete on $host --- \n"
+                                send_user "# --- $host failed ---\n$border"
+                                Report "$host   failed - timeout after bigpipe save all"
+                                continue
+                                }
+                        }
+                send -- "bigpipe config save $filename\r"
+                expect {
+                        "fail" {
+                                send_user "\n# --- Something went wrong with the bigpipe config save $filename command --- \n"
+                                send_user "# --- $host failed --- \n$border"
+                                Report "$host   failed - bigpipe config save"
+                                continue
+                                }
+                        "@$host" {
+                                send_user "\n# --- Command 'bigpipe config save $filename' was successful --- \n\n"
+                                send_user "# --- Creating a SCF backup file ---\n"
+                                }
+                        timeout {
+                                send_user "\n# --- Timeout while waiting for 'bigpipe config save' to complete on $host --- \n"
+                                send_user "# --- $host failed ---\n$border"
+                                Report "$host   failed - timeout"
+                                continue
+                                }
+                        }
+
+                send -- "bigpipe export $filename.scf\r"
+                expect {
+                        "fail" {
+                                send_user "\n# --- Something went wrong with the bigpipe export $filename.scf command ---\n"
+                                send_user "# --- $host failed ---\n$border"
+                                Report "$host   failed -  bigpipe export"
+                                continue
+                                }
+                        "@$host" {
+                                send_user "\n# --- Command 'bigpipe export $filename.scf' was successful ---\n"
+                                }
+                        timeout {
+                                send_user "\n# --- Timeout while waiting for 'bigpipe export' to complete on $host ---\n"
+                                send_user "# --- $host failed ---\n$border"
+                                Report "$host   failed - timeout"
+                                continue
+                                }
+                        }
+
+
+
+                # The 'eof' should be seen at a successful logout from the device.
+                # If it is not seen, the script will need to be terminated as a precaution.
+                # Future smarts may be added to get around this.  But for now, we will remain on the side of caution.
+                # If it fails, an email is sent to $emailto and also an ITAM ticket is generated
+
+
+                send_user "\n# --- Exiting $host ---\n"
+                send -- "exit\r"
+                expect {
+                        eof     {
+                                 send_user "# --- Successful logout of $host ---\n\n"
+                                }
+                        timeout {
+                                send_user "# --- Timeout while waiting for "eof" ---\n"
+                                send_user "# --- This is bad.  Need to terminate the script ---\n"
+                                Report "$host   eof not detected.  Terminating script."
+                                exec cat $ReportSummary $debug_log | mailx -s "network F5 daily backup summary - failure event" $emailto
+                                sleep 5
+                                exec cat iTAM_INC_email.txt | mailx -r EmailInterface@OurTicketSystem.com -s "Email Interface" EmailInterface@OurTicketSystem.com,$emailto
+                                exit
+                                }
+                        }
+
+
+
+
+                # At this point we have created a UCS and SCF on the F5 device itself, and have logged out.
+                # We use scp to copy the previously created UCS and SCF files to the shared backup directory of the jump host.
+                # Standard error checking is included and a timeout for last resort.
+
+                send_user "# --- Using SCP to grab the UCS backup file ---\n"
+                spawn scp -o "StrictHostKeyChecking no" $user@$host:$filename.ucs $backupdir/$host/$host-$timestamp.ucs
+                expect -exact "Password: "
+                send -- "$password\r"
+                expect {
+                        "No such file or directory" {
+                                send_user "\n# --- There is a problem with the specified F5 directory ---\n"
+                                send_user "# --- $host failed ---\n\n\n"
+                                Report "$host   failed - SCP error"
+                                continue
+                                }
+                        "100%"  {
+                                send_user "# --- The UCS backup for $host is now complete ---\n\n"
+                                }
+                        timeout {
+                                send_user "\n# --- Timeout while waiting for the SCP of the UCS to complete from $host--- \n"
+                                send_user "# --- $host failed ---\n$border"
+                                Report "$host   failed - SCP error"
+                                continue
+                                }
+                        }
+
+
+                send_user "# --- Using SCP to grab the SCF backup file ---\n"
+                spawn scp -o "StrictHostKeyChecking no" $user@$host:$filename.scf $backupdir/$host/$host-$timestamp.scf
+                expect -exact "Password: "
+                send -- "$password\r"
+                expect {
+                        "No such file or directory" {
+                                send_user "\n# --- There is a problem with the specified F5 directory ---\n"
+                                send_user "# --- $host failed ---\n\n\n"
+                                Report "$host   failed - SCP error"
+                                continue
+                                }
+                        "100%"  {
+                                send_user "# --- The SCF backup for $host is now complete ---\n\n"
+                                }
+                        timeout {
+                                send_user "\n# --- Timeout while waiting for the SCP of the SCF to complete from $host ---\n"
+                                send_user "# --- $host failed ---\n$border"
+
+                                Report "$host   failed - SCP error"
+                                continue
+                                }
+                        }
+
+
+
+        # It's not enough to run the backups and give ourselves a pat on the back and say "good job team".
+        # We need to do some error checking on the $filesize of the newly created backup file.
+        # If the file is below a certain size, then we need to flag it.
+        # The "sleep 5" is required to ensure the transfer is complete before file size checking begins.
+
+        sleep 5
+        send_user "# --- Now checking UCS and SCF filesize ---\n"
+
+        set filesize [file size $backupdir/$host/$host-$timestamp.scf]
+        if { $filesize <= $min_scf_file_size} {
+                        Report "$host   WARNING - SCF filesize is too small"
+                        send_user "\n# --- WARNING: $host-$timestamp.scf is too small, please investigate ---\n\n"
+        } else {
+                send_user "# --- SCF filesize seems ok ---\n"
+        }       
+
+
+
+
+        set filesize [file size $backupdir/$host/$host-$timestamp.ucs]
+        if { $filesize <= $min_ucs_file_size} {
+                        Report "$host  WARNING - UCS filesize is too small"
+                        send_user "\n# --- WARNING: $host-$timestamp.ucs is too small, please investigate ---\n\n"
+        } else {
+                send_user "# --- UCS filesize seems ok ---\n"
+        }
+
+
+
+        # Now we will remove files older than $ExpiryDays
+
+        exec find /home/tftpboot/network/config/$host/ -mtime +$ExpiryDays | xargs rm -f
+        send_user "# --- Files older then $ExpiryDays (if any) have been deleted ---\n"
+
+
+
+
+        # Symbolic links are only necessary for the UCS files.
+        # The following line is necessary on NetworkJumpHost.
+
+        exec rm -f $oldf5directory/$host.ucs
+        exec ln -sfn $backupdir/$host/$host-$timestamp.ucs $oldf5directory/$host.ucs
+        send_user "# --- Tidied up symbolic links for $host ---\n"
+        send_user "# --- $host successful ---\n"
+        send_user "\n$border"
+        Report "$host   script completed"
+
+
+        # This next bracket marks the end of the loop.
+        # If there are more entries in $devicelist it will keep looping.
+        }
+
+
+
+# Change the file permissions so that only people in the NetworkJumpHost group of "network" can view the files
+
+send_user "\n# --- Modifying backups file permissions to chmod 750 ---\n"
+exec chmod -fR 750 /home/tftpboot/network/config
+
+
+# Now that the script is complete, send an email notification
+
+# This last IF statement determines what notifications should be sent.
+# We do a simple search in our $ReportSummary file for the key words
+# of "fail" and/or "warning".
+# If a result is present, the grep program terminates with a "0" signal.
+# If a result is NOT present, the grep program terminates with a "1" signal.
+# We use the expect "catch" to harness this output and determine our next actions.
+#
+#       If a "fail" or "warning is present (a '0' was returned):
+#       Adjust the notification email subject to say "failure event".
+#       Also send a second email to create an ITAM incident docket.
+#
+#       If all backups were successful was successful (a '1' was returned):
+#       Adjust the notification email subject to say "all ok".
+
+send_user "# --- Started script at $starttime ---\n"
+send_user "# --- Finished Script at [exec date] ---\n$border"
+
+
+set Notification [catch {exec egrep -i "fail|warning" $ReportSummary}]
+if  {$Notification == 0} {
+        send_user "# --- A Fail or warning has been identified ---\n"
+        send_user "# --- Sending appropriate notifications ---\n$border"
+                exec cat $ReportSummary $debug_log | mailx -s "network F5 daily backup summary - failure event" $emailto
+                sleep 5
+                exec cat iTAM_INC_email.txt | mailx -r EmailInterface@OurTicketSystem.com -s "Email Interface" EmailInterface@OurTicketSystem.com,$emailto
+} else  {
+        send_user "# --- All completed --- \n$border"
+                exec cat $ReportSummary $debug_log | mailx -s "network F5 daily backup summary - OK" $emailto
+        }
+
